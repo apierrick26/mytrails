@@ -141,7 +141,89 @@ export function usePhotos() {
     return { error: dbError }
   }
 
-  return { uploadPhotos, fetchActivityPhotos, fetchAllPhotos, fetchCoverPhotos, deletePhoto, setCoverPhoto }
+  // Fetch photos in Storage that have no matching row in the photos table.
+  async function fetchUnclassifiedPhotos() {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) return { photos: [], error: new Error('Not authenticated') }
+
+    // 1. Collect all DB-tracked paths for this user
+    const { data: dbRows } = await supabase
+      .from('photos')
+      .select('url')
+      .eq('user_id', user.id)
+    const dbPaths = new Set((dbRows || []).map((r) => r.url))
+
+    // 2. Walk Storage tree: list top-level items under userId/
+    const { data: topItems, error: listError } = await supabase.storage
+      .from(BUCKET)
+      .list(user.id)
+    if (listError) return { photos: [], error: listError }
+
+    const storageFiles = []
+    for (const item of topItems || []) {
+      if (item.id === null) {
+        // Folder — list its children
+        const { data: subItems } = await supabase.storage
+          .from(BUCKET)
+          .list(`${user.id}/${item.name}`)
+        for (const sub of subItems || []) {
+          if (sub.id !== null) {
+            storageFiles.push({ path: `${user.id}/${item.name}/${sub.name}`, metadata: sub.metadata })
+          }
+        }
+      } else {
+        // Top-level file (e.g. from mobile direct upload)
+        storageFiles.push({ path: `${user.id}/${item.name}`, metadata: item.metadata })
+      }
+    }
+
+    // 3. Keep only paths absent from the DB
+    const orphans = storageFiles.filter((f) => !dbPaths.has(f.path))
+    if (!orphans.length) return { photos: [], error: null }
+
+    // 4. Resolve signed URLs
+    const paths = orphans.map((f) => f.path)
+    const { data: signed, error: signedError } = await supabase.storage
+      .from(BUCKET)
+      .createSignedUrls(paths, SIGNED_URL_TTL)
+    if (signedError) return { photos: [], error: signedError }
+
+    const urlMap = {}
+    for (const entry of signed || []) {
+      if (entry.signedUrl) urlMap[entry.path] = entry.signedUrl
+    }
+
+    const photos = orphans.map((f) => ({
+      id: f.path,                            // no DB id, use path as stable key
+      url: f.path,
+      signed_url: urlMap[f.path] || null,
+      created_at: f.metadata?.lastModified || null,
+    }))
+
+    return { photos, error: null }
+  }
+
+  // Link an unclassified Storage file to an existing activity.
+  async function attachPhotoToActivity(storagePath, activityId) {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) return { error: new Error('Not authenticated') }
+
+    const { data: existing } = await supabase
+      .from('photos')
+      .select('position')
+      .eq('activity_id', activityId)
+      .order('position', { ascending: false })
+      .limit(1)
+    const nextPosition = existing?.[0]?.position != null ? existing[0].position + 1 : 0
+
+    const { error } = await supabase
+      .from('photos')
+      .insert({ activity_id: activityId, user_id: user.id, url: storagePath, position: nextPosition })
+
+    return { error }
+  }
+
+  return { uploadPhotos, fetchActivityPhotos, fetchAllPhotos, fetchCoverPhotos, deletePhoto, setCoverPhoto, fetchUnclassifiedPhotos, attachPhotoToActivity }
 }
 
 // ── Internal helper ──────────────────────────────────────────────────────────
